@@ -96,7 +96,7 @@ rho_values = [0.1, 0.2, 0.3, 0.4]
 
 
 # Monte Carlo simulation parameters
-n_iterations = 1000  # Number of Monte Carlo iterations
+n_iterations = 10  # Number of Monte Carlo iterations
 
 # Parallel processing using joblib
 simulation_results = {}
