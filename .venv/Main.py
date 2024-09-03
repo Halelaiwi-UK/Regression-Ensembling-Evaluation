@@ -1,3 +1,24 @@
+"""
+This script simulates the performance of model ensembles with varying correlation (Rho) values using Monte Carlo simulations and S&P500 data.
+
+The primary goal is to analyze how the combined performance of an ensemble, measured by Rho values,
+improves/changes as more models are added to the ensemble.
+The script runs multiple Monte Carlo simulations for different desired Rho values and fits
+a logistic function to the results to predict optimal ensemble sizes.
+
+
+However, in this code we assume the following:
+-Each model is independent
+-All models have similar Rhos, although I may implement a function/class to simulate randomize Rho values/Distributed rho values
+-The Rho value and the number of models are related via a logistic function of the form c/(1+e^(-a(x-b))), this assumption os based
+ on the fact that the maximum Rho possible is 1.
+
+Key Features:
+- Generates synthetic data with controlled correlations to the target variable.
+- Simulates ensemble performance using Ridge regression as a meta-learner.
+- Visualizes the relationship between the number of models in an ensemble and the resulting combined Rho.
+"""
+
 import math
 import numpy as np
 import pandas as pd
@@ -13,6 +34,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
 from joblib import Parallel, delayed
 import random
+
 
 # Monte Carlo simulation for one iteration
 def monte_carlo_iteration(rho: float, max_N_Models: int, n_of_features: int, test_length: int, num_samples: int) -> list:
