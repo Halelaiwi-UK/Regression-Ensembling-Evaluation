@@ -11,7 +11,7 @@ However, in this code we assume the following:
 -Each model is independent
 -All models have similar Rhos, although I may implement a function/class to simulate randomize Rho values/Distributed rho values
 -The Rho value and the number of models are related via a logistic function of the form c/(1+e^(-a(x-b))), this assumption os based
- on the fact that the maximum Rho possible is 1.
+ on the fact that the maximum Rho possible is 1 and minimum is -1.
 
 Key Features:
 - Generates synthetic data with controlled correlations to the target variable.
@@ -26,7 +26,7 @@ import statsmodels.api as sm
 import matplotlib.pyplot as plt
 from scipy.stats import pearsonr
 from scipy.optimize import minimize, curve_fit
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, false
 from statsmodels.genmod.families.links import Logit
 from statsmodels.sandbox.predict_functional import predict_functional
 from sklearn.linear_model import Ridge
@@ -34,52 +34,6 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
 from joblib import Parallel, delayed
 import random
-
-
-# Monte Carlo simulation for one iteration
-def monte_carlo_iteration(rho: float, max_N_Models: int, n_of_features: int, test_length: int, num_samples: int) -> list:
-    """
-     Performs a single iteration of a Monte Carlo simulation to evaluate the performance of model ensembles.
-
-     Parameters:
-     rho (float): Desired correlation between the generated features and the target variable.
-     max_N_Models (int): maximum number of models for ensemble.
-     n_of_features (int): The number of features to generate for each model.
-     test_length (int): The number of data points to use in the testing set.
-     num_samples (int): The total number of data points to generate.
-
-     Returns:
-     list: A list of Pearson correlation coefficients (Rho) for each ensemble size from 1 to `max_N_Models`.
-    """
-
-    # Randomize the seed for this iteration
-    seed = random.randint(0, 10000)
-    np.random.seed(seed)
-
-    y = np.random.randn(num_samples)
-    y_train, y_test = y[:test_length], y[test_length:]
-    # Normalize y to have zero mean and unit variance
-    y_test = (y_test - y_test.mean()) / y_test.std()
-    y_train = (y_train - y_train.mean()) / y_train.std()
-
-    rho_results = []
-
-    for i in range(1, max_N_Models + 1):
-        predictions_train = {}
-        predictions_test = {}
-        for j in range(1, i + 1):
-            features_train = generate_features(len(y_train), n_of_features, y_train, desired_rho=rho)
-            features_test = generate_features(len(y_test), n_of_features, y_test, desired_rho=rho)
-            features_train = sm.add_constant(features_train)
-            model = sm.OLS(y_train, features_train).fit()
-            features_test = sm.add_constant(features_test)
-            predictions_train[j] = model.predict(features_train)
-            predictions_test[j] = model.predict(features_test)
-
-        meta_learner_predictions = ridge_meta_learner(predictions_train, predictions_test, y_train)
-        rho_avg = pearsonr(y_test, meta_learner_predictions)[0]
-        rho_results.append(rho_avg)
-    return rho_results
 
 
 def logistic_function(x_value, growth, offset, maximum) -> float:
@@ -114,21 +68,33 @@ def generate_features(n_of_samples: int, n_features: int, y_normalized: pd.Serie
     features_to_generate = np.zeros((n_of_samples, n_features))
 
     for n in range(n_features):
+        # Generate a random rho for each feature to add diversity
+        desired_rho = np.clip(np.random.uniform(desired_rho * 0.9, desired_rho * 1.1), -1, 1)
+
         # Generate random feature
         x_random = np.random.randn(n_of_samples)
 
         # Normalize the random feature
         x_random_normalized = (x_random - x_random.mean()) / x_random.std()
 
+        # Add controlled noise (simulating real-world imperfections)
+        noise = np.random.normal(0, 0.1, n_of_samples)  # Noise with mean 0 and small std dev
+
+        # Create a linear combination of y_normalized and the random feature with added noise
+        feature = desired_rho * y_normalized + np.sqrt(1 - desired_rho ** 2) * x_random_normalized + noise
+        # Add non-linear feature occasionally
+        # if n % 3 == 1:
+        #     feature = np.exp(feature / 10)
+
+        # Normalize the generated feature
+        feature = (feature - feature.mean()) / feature.std()
+
         # Create adjusted feature with desired correlation
-        features_to_generate[:, n] = (
-                desired_rho * y_normalized +
-                np.sqrt(1 - desired_rho ** 2) * x_random_normalized
-        )
+        features_to_generate[:, n] = feature
 
     return features_to_generate
 
-def ridge_meta_learner(ols_predictions_train: dict, ols_predictions_test: dict, y_value_train: pd.Series) -> np.array:
+def ridge_meta_learner(ols_predictions_train: list, ols_predictions_test: list, y_value_train: pd.Series) -> np.array:
     """
      Trains and fits a ridge regression model to predict y values using OLS regression model's predictions.
 
@@ -139,8 +105,8 @@ def ridge_meta_learner(ols_predictions_train: dict, ols_predictions_test: dict, 
      Returns:
          np.array: a numpy array containing the final predictions of the ridge model
     """
-    x_meta_train = np.column_stack(list(ols_predictions_train.values()))
-    x_meta_test = np.column_stack(list(ols_predictions_test.values()))
+    x_meta_train = np.column_stack(ols_predictions_train)
+    x_meta_test = np.column_stack(ols_predictions_test)
     ridge_model = Ridge(alpha=10)
     ridge_model.fit(x_meta_train, y_value_train)
     meta_predictions = ridge_model.predict(x_meta_test)
@@ -159,87 +125,51 @@ regression_variables = regression_variables.sort_index()
 y = regression_variables["S&P500"]
 
 # Parameters
-n_of_features = 10
+n_of_features = 20
 test_length = int(len(y) * 0.2)
-max_N_Models = 50
+max_N_Models = 100
 num_samples = len(y)
 rho_values = [0.1, 0.2, 0.3, 0.4]
-y_test, y_train = y[test_length:], y[:test_length]
+y_train, y_test = y[test_length:], y[:test_length]
 
 # Normalize y to have zero mean and unit variance
-y_test = (y_test - y_test.mean()) / y_test.std()
-y_train = (y_train - y_train.mean()) / y_train.std()
+y_train_std = y_train.std()
+y_train_mean = y_train.mean()
+y_test = (y_test - y_train_mean) / y_train_std
+y_train = (y_train - y_train_mean) / y_train_std
 
-# Monte Carlo simulation parameters
-n_iterations = 10
-simulation_results = {}
+#ta lib
 
-# Run simulation for each desired rho
-for rho in rho_values:
-    print(f"Rho {rho} simulation...")
-    # Parallel processing using joblib
-    results = Parallel(n_jobs=-1)(delayed(monte_carlo_iteration)(rho, max_N_Models, n_of_features, test_length, num_samples)
-                                  for _ in range(n_iterations))
-    simulation_results[rho] = np.array(results)
-
-# Calculate the mean and standard deviation of simulation results
-mean_rho = {rho: np.mean(simulation_results[rho], axis=0) for rho in rho_values}
-std_rho = {rho: np.std(simulation_results[rho], axis=0) for rho in rho_values}
-
-# Fit and plot curve of each simulation results
-for rho in rho_values:
-    num_models_range = np.arange(1, max_N_Models + 1)
-    # fit the logistic function onto our data
-    popt, _ = curve_fit(logistic_function, num_models_range, mean_rho[rho], p0=[1, max_N_Models / 2, 0.5], maxfev=10000)
-
-    # create x and y points of our fit
-    x_fit = np.linspace(num_models_range.min(), num_models_range.max(), 500)
-    y_fit = logistic_function(x_fit, *popt)
-
-    # Plot the results
-    plt.figure(figsize=(10, 6))
-    plt.plot(num_models_range, mean_rho[rho], 'o', label=f'Observed Mean Rho (Rho = {rho})')
-    plt.plot(x_fit, y_fit, '-', label=f'Logistic Fit (Rho = {rho})', color='r')
-
-    # Print fitted parameters
-    a, b, c = popt
-    epsilon = 1e-3
-    x_n = b - (1/a) * math.log(epsilon/(c*a))
-    print(f"--------Simulation for Rho = {rho}--------")
-    print(f"for e = {epsilon}, x should be greater than: {x_n:.4f}")
-    print(f"Recommend N of models = {x_n}")
-    print(f"Ideal rho is somewhere near : {c} (BASED ON SIMULATION)")
-    print()
-    plt.title(f'Rho = {rho}')
-    plt.xlabel('Number of Models')
-    plt.ylabel('Mean Rho')
-    plt.legend()
-    plt.grid(True)
-    plt.show()
+# N of models with technicals using Combinatorics, The rho value
+# Try with different meta learners
+# Change values to relative percentage change
 
 
 # Run model on S&P500 y values
 for rho in rho_values:
     print(f"Running on Rho = {rho}...")
     rho_with_n_models = []
-    # TODO: COULD BE IMPROVED, CURRENTLY VERY COMPUTATIONAL EXPENSIVE (Train on 50 models, then combine and increase by one each time)
-    # Currently it creates N models for each N iteration which could train up to n(n+1)/2 models (1275 instead of 50)
+    # Train models
+    models = []
+    predictions_train = []
+    predictions_test = []
     for i in range(1, max_N_Models+1):
-        N_models = i
-        predictions_train = {}
-        predictions_test = {}
-        # Fit and train on the jth model up to i
-        for j in range(1, i + 1):
             features_train = generate_features(len(y_train), n_of_features, y_train, desired_rho=rho)
             features_test = generate_features(len(y_test), n_of_features, y_test, desired_rho=rho)
             features_train = sm.add_constant(features_train)
             model = sm.OLS(y_train, features_train).fit()
             features_test = sm.add_constant(features_test)
-            predictions_train[j] = model.predict(features_train)
-            predictions_test[j] = model.predict(features_test)
+            models.append(model)
+            predictions_train.append(model.predict(features_train))
+            predictions_test.append(model.predict(features_test))
 
+    # Fit and train meta-learner on a specified number of models (1 to Max_N_models)
+    for i in range(1, max_N_Models+1):
+        N_models = i
+        pred_train = predictions_train[:N_models]
+        pred_test = predictions_test[:N_models]
         # Meta learner used for ensambling, currently Ridge learner
-        meta_learner_predictions = ridge_meta_learner(predictions_train, predictions_test, y_train)
+        meta_learner_predictions = ridge_meta_learner(pred_train, pred_test, y_train)
         rho_avg = pearsonr(y_test, meta_learner_predictions)[0]
         rho_with_n_models.append(rho_avg)
 
@@ -249,19 +179,25 @@ for rho in rho_values:
     # Fit the logistic function to the data
     num_models_range = np.arange(1, max_N_Models + 1)
     # noinspection PyTupleAssignmentBalance
-    popt, _ = curve_fit(logistic_function, num_models_range, rho_with_n_models, p0=[1, (max_N_Models/2), 0.5])
+    popt, _ = curve_fit(logistic_function, num_models_range, rho_with_n_models, p0=[1, (max_N_Models/2), 0.5], maxfev=10000)
 
     # fitted parameters
     a,b,c = popt
     print(f'Logistic Function Parameters: a={a:.4f}, b={b:.4f}, c={c:.4f}')
 
     epsilon = 1e-3
-    x_n = b - (1/a) * math.log(epsilon/(c*a))
-    print(f"--------Actual for Rho = {rho}--------")
-    print(f"for e = {epsilon}, x should be greater than: {x_n:.4f}")
-    print(f"Recommend N of models = {x_n}")
-    print(f"Ideal rho is somewhere near : {c} (BASED ON PREVIOUS DATA)")
-    print()
+    try:
+        x_n = b - (1/a) * math.log(epsilon/(c*a))
+        print(f"--------Actual for Rho = {rho}--------")
+        print(f"for e = {epsilon}, x should be greater than: {x_n:.4f}")
+        print(f"Recommend N of models = {x_n}")
+        print(f"Ideal rho is somewhere near : {c} (BASED ON PREVIOUS DATA)")
+        print()
+    except ValueError as e:
+        print(f"--------Actual for Rho = {rho}--------")
+        print(f"Ideal rho is somewhere near : {c} (BASED ON PREVIOUS DATA)")
+        print()
+        x_n = -1
     # Generate data for plotting the fit
     x_fit = np.linspace(num_models_range.min(), num_models_range.max(), 500)
     y_fit = logistic_function(x_fit, *popt)
