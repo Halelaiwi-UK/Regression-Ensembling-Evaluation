@@ -1,11 +1,8 @@
 """
-This script simulates the performance of model ensembles with varying correlation (Rho) values using Monte Carlo simulations and S&P500 data.
+This script simulates the performance of model ensembles with varying correlation (Rho) values using S&P500 data.
 
 The primary goal is to analyze how the combined performance of an ensemble, measured by Rho values,
 improves/changes as more models are added to the ensemble.
-The script runs multiple Monte Carlo simulations for different desired Rho values and fits
-a logistic function to the results to predict optimal ensemble sizes.
-
 
 However, in this code we assume the following:
 -Each model is independent
@@ -20,7 +17,9 @@ Key Features:
 """
 
 import math
+import sys
 import numpy as np
+import pandas
 import pandas as pd
 import statsmodels.api as sm
 import matplotlib.pyplot as plt
@@ -32,8 +31,20 @@ from statsmodels.sandbox.predict_functional import predict_functional
 from sklearn.linear_model import Ridge
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
+from sklearn.decomposition import PCA
 from joblib import Parallel, delayed
 import random
+import talib as ta
+import yfinance as yf
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+import itertools
+from keras.models import Sequential
+from keras.layers import Dense, Dropout
+from keras import Input
+from keras.callbacks import EarlyStopping
+from tensorflow.python.keras.utils.version_utils import callbacks
+from keras.losses import Huber
+from xgboost import XGBRegressor
 
 
 def logistic_function(x_value, growth, offset, maximum) -> float:
@@ -82,9 +93,6 @@ def generate_features(n_of_samples: int, n_features: int, y_normalized: pd.Serie
 
         # Create a linear combination of y_normalized and the random feature with added noise
         feature = desired_rho * y_normalized + np.sqrt(1 - desired_rho ** 2) * x_random_normalized + noise
-        # Add non-linear feature occasionally
-        # if n % 3 == 1:
-        #     feature = np.exp(feature / 10)
 
         # Normalize the generated feature
         feature = (feature - feature.mean()) / feature.std()
@@ -112,38 +120,141 @@ def ridge_meta_learner(ols_predictions_train: list, ols_predictions_test: list, 
     meta_predictions = ridge_model.predict(x_meta_test)
     return meta_predictions
 
+
+def neural_network_meta_learner(predictions_train, predictions_test, y_train):
+    # Stack predictions from the base models
+    X_meta_train = pd.DataFrame(predictions_train).T
+    X_meta_test = pd.DataFrame(predictions_test).T
+
+    # Build a neural network with Input layer
+    model = Sequential()
+    model.add(Input(shape=(X_meta_train.shape[1],)))  # Define input shape
+    model.add(Dense(64, activation='relu'))
+    model.add(Dropout(0.3))  # Dropout to prevent overfitting
+    # model.add(Dense(32, activation='relu'))
+    model.add(Dense(1))  # Single output for regression
+    # Compile the model
+    huber_loss = Huber(delta=0.5)  # You can adjust delta depending on how you want to handle outliers
+    model.compile(optimizer='adam', loss=huber_loss)
+
+    # Fit the neural network (you can adjust the number of epochs)
+    early_stopping = EarlyStopping(monitor='loss', patience=10, restore_best_weights=True)
+    model.fit(X_meta_train, y_train, epochs=100, batch_size=64, verbose=1, callbacks=[early_stopping])
+
+    # Get meta predictions
+    meta_predictions = model.predict(X_meta_test)
+
+    return meta_predictions.flatten()
+
+def xgboost_meta_learner(predictions_train, predictions_test, y_train):
+    X_train = np.column_stack(predictions_train)
+    X_test = np.column_stack(predictions_test)
+    xgb_model = XGBRegressor(n_estimators=250, learning_rate=0.05)
+    xgb_model.fit(X_train, y_train)
+    return xgb_model.predict(X_test)
+
+def generate_technicals(close: pd.Series, high: pd.Series, low: pd.Series, volume: pd.Series) -> pd.DataFrame:
+    # Calculate various technical indicators
+    sma = ta.SMA(close, timeperiod=30)
+    ema = ta.EMA(close, timeperiod=30)
+    rsi = ta.RSI(close, timeperiod=30)
+    atr = ta.ATR(high, low, close, timeperiod=14)  # ATR requires high, low, and close (y_value is the close price)
+    mom = ta.MOM(close, timeperiod=30)
+    obv = ta.OBV(close, volume)  # OBV requires close (y_value) and volume
+    slowk, slowd = ta.STOCH(high, low, close, fastk_period=14, slowk_period=3, slowk_matype=0, slowd_period=3, slowd_matype=0)  # Stochastic Oscillator
+    macd, macd_signal, macd_hist = ta.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
+    ad = ta.AD(high, low, close, volume)  # Accumulation/Distribution requires high, low, close (y_value), and volume
+    upper_band, middle_band, lower_band = ta.BBANDS(close, timeperiod=20, nbdevup=2, nbdevdn=2, matype=0)
+    roc = ta.ROC(close, timeperiod=30)
+    width_Bollinger_Band = (upper_band - lower_band) / middle_band * 100
+    # Create a DataFrame with the technical indicators
+    df_technicals = pd.DataFrame({
+        'ATR': atr,
+        # 'SMA': sma,
+        # 'EMA': ema,
+        'RSI': rsi,
+        'MOM': mom,
+        'OBV': obv,
+        'STOCH_K': slowk,
+        'STOCH_D': slowd,
+        'MACD': macd,
+        'MACD_Signal': macd_signal,
+        'MACD_Hist': macd_hist,
+        'AD': ad,
+        'Bollinger_Band_width' : width_Bollinger_Band
+    })
+
+    # Calculate percentage change for each column
+    df_technicals_pct_change = df_technicals.pct_change() * 100
+    df_technicals_pct_change = df_technicals_pct_change.dropna()
+    return df_technicals_pct_change
+
+
+def get_combinations(df_technicals : pd.DataFrame, n_features : int = 2) -> list:
+    indicators = df_technicals.columns.tolist()
+    used_indicators = set()
+    valid_combinations = []
+
+    # Generate all pairs of technical indicators
+    for combo in itertools.combinations(indicators, n_features):
+        if combo[0] not in used_indicators and combo[0] not in used_indicators:
+            # If neither indicator has been used, add the combo and mark them as used
+            valid_combinations.append(combo)
+            used_indicators.update(combo)
+
+    return valid_combinations
+
 # PostgreSQL connection setup
 DATABASE_URL = "postgresql+psycopg2://postgres@localhost:5432/sp500"
 engine = create_engine(DATABASE_URL)
 
 # Read S&P500 Data
-query = "SELECT * FROM sp500_index"
+
+query = "SELECT * FROM sp500_data_yahoo"
 regression_variables = pd.read_sql(query, engine)
-regression_variables['Date'] = pd.to_datetime(regression_variables['Date'])
-regression_variables.set_index('Date', inplace=True)
+regression_variables['date'] = pd.to_datetime(regression_variables['date'])
+regression_variables.set_index('date', inplace=True)
 regression_variables = regression_variables.sort_index()
-y = regression_variables["S&P500"]
+
+# Extract the necessary columns
+high = regression_variables['high']
+low = regression_variables['low']
+close = regression_variables['close']
+volume = regression_variables['volume']
+
+y = close
 
 # Parameters
 n_of_features = 20
 test_length = int(len(y) * 0.2)
 max_N_Models = 100
 num_samples = len(y)
-rho_values = [0.1, 0.2, 0.3, 0.4]
+# rho_values = [0.1, 0.2, 0.3, 0.4]
+rho_values = ["UNKNOWN"]
 y_train, y_test = y[test_length:], y[:test_length]
+train_technicals = generate_technicals(y_train, high[test_length:], low[test_length:], volume[test_length:])
+test_technicals = generate_technicals(y_test, high[:test_length], low[:test_length], volume[:test_length])
+y_train = y_train.pct_change() * 100
+y_test = y_test.pct_change() * 100
+# Drop NaN values from technical indicators
 
-# Normalize y to have zero mean and unit variance
-y_train_std = y_train.std()
-y_train_mean = y_train.mean()
-y_test = (y_test - y_train_mean) / y_train_std
-y_train = (y_train - y_train_mean) / y_train_std
+# Lag the technical indicators by 1 day to avoid leakage
+train_technicals = train_technicals.shift(1)
+test_technicals = test_technicals.shift(1)
 
-#ta lib
+train_technicals = train_technicals.dropna()
+test_technicals = test_technicals.dropna()
+print("Technicals used:", train_technicals.columns)
+# Align y_train and y_test to the cleaned technicals data
+y_train = y_train[-len(train_technicals):]  # Trim y_train to match technicals length
+y_test = y_test[-len(test_technicals):]
+"""
+# N of models with technicals using Combinatorics, The rho value : TODO
+# Try with different meta learners : TODO
+# Change values to relative percentage change : DONE
+"""
 
-# N of models with technicals using Combinatorics, The rho value
-# Try with different meta learners
-# Change values to relative percentage change
-
+combinations = get_combinations(train_technicals, n_features = 1)
 
 # Run model on S&P500 y values
 for rho in rho_values:
@@ -153,58 +264,68 @@ for rho in rho_values:
     models = []
     predictions_train = []
     predictions_test = []
-    for i in range(1, max_N_Models+1):
-            features_train = generate_features(len(y_train), n_of_features, y_train, desired_rho=rho)
-            features_test = generate_features(len(y_test), n_of_features, y_test, desired_rho=rho)
-            features_train = sm.add_constant(features_train)
-            model = sm.OLS(y_train, features_train).fit()
-            features_test = sm.add_constant(features_test)
-            models.append(model)
-            predictions_train.append(model.predict(features_train))
-            predictions_test.append(model.predict(features_test))
+    model_rho = []
+    # for i in range(1, max_N_Models+1):
+    for i, combo in enumerate(combinations):
+        x_train = train_technicals[list(combo)]
+        x_test = test_technicals[list(combo)]
+        x_train = sm.add_constant(x_train)
+        ridge_model = Ridge(alpha=10)
+        ridge_model.fit(x_train, y_train)
+        # model = sm.OLS(y_train, x_train).fit()
+        x_test = sm.add_constant(x_test)
+        models.append(ridge_model)
+        predictions_train.append(ridge_model.predict(x_train))
+        predictions_test.append(ridge_model.predict(x_test))
+        model_rho.append(pearsonr(y_test, predictions_test[len(predictions_test)-1])[0])
+
 
     # Fit and train meta-learner on a specified number of models (1 to Max_N_models)
-    for i in range(1, max_N_Models+1):
-        N_models = i
-        pred_train = predictions_train[:N_models]
-        pred_test = predictions_test[:N_models]
-        # Meta learner used for ensambling, currently Ridge learner
-        meta_learner_predictions = ridge_meta_learner(pred_train, pred_test, y_train)
-        rho_avg = pearsonr(y_test, meta_learner_predictions)[0]
-        rho_with_n_models.append(rho_avg)
-
+    # for i in range(1, max_N_Models+1):
+    for i, _ in enumerate(combinations):
+        if (model_rho[i] > 0):
+            N_models = i + 1
+            pred_train = predictions_train[:N_models]
+            pred_test = predictions_test[:N_models]
+            # Meta learner used for ensembling, currently Ridge learner
+            meta_learner_predictions = ridge_meta_learner(pred_train, pred_test, y_train)
+            rho_avg = pearsonr(y_test, meta_learner_predictions)[0]
+            rho_with_n_models.append(rho_avg)
+    for i in range(len(rho_with_n_models)):
+        print(f"{i+1} models rho : {rho_with_n_models[i]}")
+    max_N_Models = len(rho_with_n_models)
 
     # Plotting
 
-    # Fit the logistic function to the data
-    num_models_range = np.arange(1, max_N_Models + 1)
-    # noinspection PyTupleAssignmentBalance
-    popt, _ = curve_fit(logistic_function, num_models_range, rho_with_n_models, p0=[1, (max_N_Models/2), 0.5], maxfev=10000)
-
-    # fitted parameters
-    a,b,c = popt
-    print(f'Logistic Function Parameters: a={a:.4f}, b={b:.4f}, c={c:.4f}')
-
-    epsilon = 1e-3
-    try:
-        x_n = b - (1/a) * math.log(epsilon/(c*a))
-        print(f"--------Actual for Rho = {rho}--------")
-        print(f"for e = {epsilon}, x should be greater than: {x_n:.4f}")
-        print(f"Recommend N of models = {x_n}")
-        print(f"Ideal rho is somewhere near : {c} (BASED ON PREVIOUS DATA)")
-        print()
-    except ValueError as e:
-        print(f"--------Actual for Rho = {rho}--------")
-        print(f"Ideal rho is somewhere near : {c} (BASED ON PREVIOUS DATA)")
-        print()
-        x_n = -1
-    # Generate data for plotting the fit
-    x_fit = np.linspace(num_models_range.min(), num_models_range.max(), 500)
-    y_fit = logistic_function(x_fit, *popt)
+    # # Fit the logistic function to the data
+    # num_models_range = np.arange(1, max_N_Models + 1)
+    # # noinspection PyTupleAssignmentBalance
+    # popt, _ = curve_fit(logistic_function, num_models_range, rho_with_n_models, p0=[1, (max_N_Models/2), 0.5], maxfev=10000)
+    #
+    # # fitted parameters
+    # a,b,c = popt
+    # print(f'Logistic Function Parameters: a={a:.4f}, b={b:.4f}, c={c:.4f}')
+    #
+    # epsilon = 1e-3
+    # try:
+    #     x_n = b - (1/a) * math.log(epsilon/(c*a))
+    #     print(f"--------Actual for Rho = {rho}--------")
+    #     print(f"for e = {epsilon}, x should be greater than: {x_n:.4f}")
+    #     print(f"Recommend N of models = {x_n}")
+    #     print(f"Ideal rho is somewhere near : {c} (BASED ON PREVIOUS DATA)")
+    #     print()
+    # except ValueError as e:
+    #     print(f"--------Actual for Rho = {rho}--------")
+    #     print(f"Ideal rho is somewhere near : {c} (BASED ON PREVIOUS DATA)")
+    #     print()
+    #     x_n = -1
+    # # Generate data for plotting the fit
+    # x_fit = np.linspace(num_models_range.min(), num_models_range.max(), 500)
+    # y_fit = logistic_function(x_fit, *popt)
 
 
     plt.figure(figsize=(10, 6))
-    plt.plot(x_fit, y_fit, '-', label='Logistic Fit', color='r')
+    # plt.plot(x_fit, y_fit, '-', label='Logistic Fit', color='r')
     plt.plot(range(1, max_N_Models + 1), rho_with_n_models, color='b')
     # Export the data to a text file
     np.savetxt(f"Rho_{rho}.csv", np.column_stack([range(1, max_N_Models + 1), rho_with_n_models]), delimiter=",", header="x,y", comments="")
@@ -213,12 +334,12 @@ for rho in rho_values:
     plt.xlabel('N Models Combined')
     plt.ylabel('Rho as Models are combined')
     # Add logistic function parameters to the side of the plot
-    plt.text(x=plt.xlim()[1] * 0.6, y=plt.ylim()[1] * 0.3,
-             s=f'Logistic Function Parameters:\na={a:.4f}\nb={b:.4f}\nc={c:.4f}\n'
-               f'Recommend N models for e= {epsilon}: {int(x_n)}',
-             bbox=dict(facecolor='white', alpha=0.8),
-             fontsize=12, color='black')
-    plt.legend(loc='upper left')
+    # plt.text(x=plt.xlim()[1] * 0.6, y=plt.ylim()[1] * 0.3,
+    #          s=f'Logistic Function Parameters:\na={a:.4f}\nb={b:.4f}\nc={c:.4f}\n'
+    #            f'Recommend N models for e= {epsilon}: {int(x_n)}',
+    #          bbox=dict(facecolor='white', alpha=0.8),
+    #          fontsize=12, color='black')
+    # plt.legend(loc='upper left')
     plt.grid(True)
     plt.show()
 
@@ -257,4 +378,4 @@ plt.xlabel('Number of Models')
 plt.ylabel('Combined Rho Value')
 plt.xlim(xmin=1, xmax=max_N_Models+1)
 plt.legend()
-plt.show()
+# plt.show()
