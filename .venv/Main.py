@@ -1,381 +1,220 @@
-"""
-This script simulates the performance of model ensembles with varying correlation (Rho) values using S&P500 data.
-
-The primary goal is to analyze how the combined performance of an ensemble, measured by Rho values,
-improves/changes as more models are added to the ensemble.
-
-However, in this code we assume the following:
--Each model is independent
--All models have similar Rhos, although I may implement a function/class to simulate randomize Rho values/Distributed rho values
--The Rho value and the number of models are related via a logistic function of the form c/(1+e^(-a(x-b))), this assumption os based
- on the fact that the maximum Rho possible is 1 and minimum is -1.
-
-Key Features:
-- Generates synthetic data with controlled correlations to the target variable.
-- Simulates ensemble performance using Ridge regression as a meta-learner.
-- Visualizes the relationship between the number of models in an ensemble and the resulting combined Rho.
-"""
-
-import math
-import sys
-import numpy as np
-import pandas
-import pandas as pd
-import statsmodels.api as sm
 import matplotlib.pyplot as plt
-from scipy.stats import pearsonr
-from scipy.optimize import minimize, curve_fit
-from sqlalchemy import create_engine, false
-from statsmodels.genmod.families.links import Logit
-from statsmodels.sandbox.predict_functional import predict_functional
-from sklearn.linear_model import Ridge
-from sklearn.model_selection import train_test_split
+from Ensembler import Ensembler
+from preproccesor import Preprocessor
+import pandas as pd
+import numpy as np
+import math
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.decomposition import PCA
-from joblib import Parallel, delayed
-import random
-import talib as ta
-import yfinance as yf
-from statsmodels.stats.outliers_influence import variance_inflation_factor
-import itertools
-from keras.models import Sequential
-from keras.layers import Dense, Dropout
-from keras import Input
-from keras.callbacks import EarlyStopping
-from tensorflow.python.keras.utils.version_utils import callbacks
-from keras.losses import Huber
-from xgboost import XGBRegressor
+from sklearn.model_selection import train_test_split
+from matplotlib import cm
+from matplotlib.colors import Normalize
+from sklearn.metrics import mean_absolute_error, mean_squared_error, mean_absolute_percentage_error, r2_score
+from scipy.stats import spearmanr, pearsonr
+from statsmodels.distributions.empirical_distribution import ECDF
+
+def bin_values(y_train: pd.Series, y_test: pd.Series, num_bins=10) -> tuple:
+    # Compute the PDF by binning the percentage changes for y_train
+    pdf, bins = np.histogram(y_train, bins=num_bins, density=True)
+
+    # Compute the CDF from the PDF
+    cdf = np.cumsum(pdf) * np.diff(bins)  # Multiply by bin width to scale correctly
+
+    # Apply binning to y_train
+    y_train_cdf = np.digitize(y_train, bins, right=True) - 1  # Align bin index
+    y_train_cdf = np.clip(y_train_cdf, 0, len(cdf) - 1)  # Ensure indices stay within range
+    y_train_transformed = cdf[y_train_cdf]  # Map to CDF values
+
+    # Apply the same binning to y_test using bins derived from y_train
+    y_test_cdf = np.digitize(y_test, bins, right=True) - 1  # Align bin index
+    y_test_cdf = np.clip(y_test_cdf, 0, len(cdf) - 1)  # Ensure indices stay within range
+    y_test_transformed = cdf[y_test_cdf]  # Map to CDF values
+
+    # Return both transformed series
+    return pd.Series(y_train_transformed, index=y_train.index), pd.Series(y_test_transformed, index=y_test.index)
+
+# Initialize class to manage preprocessing easily
+preprocessor = Preprocessor()
+
+# Download data if doesn't exist
+target_stocks = ["JPM", "GS", "C", "MS", "BAC", "WFC", "AXP", "MA", "V"]
+for stock in target_stocks:
+    stock_data = preprocessor.get_stock_by_name(stock)
+    # Only upload if new data was downloaded
+    if not stock_data.empty:
+        # Convert all column names to lowercase and remove whitespace
+        stock_data.columns = stock_data.columns.str.lower()
+        stock_data.columns = stock_data.columns.str.replace(" ", "_")
+        preprocessor.upload_to_postgres(stock_data, stock)
 
 
-def logistic_function(x_value, growth, offset, maximum) -> float:
-    """
-     Used to find the best logistic fit for our simulation and actual run on the S&P500 data
+# Get sp500 data
+sp500_data = preprocessor.get_sp500()
+y_sp500 = sp500_data['close']
 
-     Parameters:
-     None, They are automatically fitted via another function
-
-     Returns:
-        Float: The expected Rho value at a specific X_value (Number of models used that each have a specified rho)
-    """
-
-    return maximum/(1+np.exp(-growth*(x_value-offset)))
+# Retrieve closing value of stocks and store them in one large df
+stocks_close_df = pd.DataFrame(index=y_sp500.index)
+for stock in target_stocks:
+    stock_data = preprocessor.get_stock(stock)
+    stocks_close_df[stock] = stock_data['close']
 
 
-def generate_features(n_of_samples: int, n_features: int, y_normalized: pd.Series, desired_rho:float =0.1) -> np.array:
-    """
-     Generates N_features features such that each feature has a Rho correlation to target equal to desired_rho
+# Split data and generate technicals
+train_length = int(len(stocks_close_df) * 0.7)  # 70% as train
 
-     Parameters:
-     n_of_samples (int): Number of samples to generate
-     n_features (int): Number of features to generate
-     y_normalize (pd.Series): Series of y normalized values to use for rho correlation
-     desired_rho (float): Desired correlation between the generated features and y_normalized
+# Split into 70% / 30%
+y_sp500 = y_sp500.shift(-5).pct_change(fill_method=None).dropna()
+y_train, y_test = (y_sp500[:train_length], y_sp500[train_length:])
 
-     Returns:
-         np.array: a numpy array of dimensions (n_of_samples, n_features)
-    """
-    seed = random.randint(0, 10000)
-    np.random.seed(seed)
-    features_to_generate = np.zeros((n_of_samples, n_features))
+stocks_close_df = stocks_close_df.shift(-5).pct_change(fill_method=None).dropna()
+stocks_y_train, stocks_y_test = (stocks_close_df.iloc[:train_length], stocks_close_df.iloc[train_length:])
 
-    for n in range(n_features):
-        # Generate a random rho for each feature to add diversity
-        desired_rho = np.clip(np.random.uniform(desired_rho * 0.9, desired_rho * 1.1), -1, 1)
+# Match volatility
+stocks_y_train, stocks_y_test = preprocessor.match_volatility(stocks_y_train, stocks_y_test)
 
-        # Generate random feature
-        x_random = np.random.randn(n_of_samples)
+for col in stocks_y_train.columns:
+    stocks_y_train[col], stocks_y_test[col] = bin_values(stocks_y_train[col], stocks_y_test[col], num_bins=len(stocks_y_train[col]) // 2)
 
-        # Normalize the random feature
-        x_random_normalized = (x_random - x_random.mean()) / x_random.std()
+ensembler = Ensembler()
+predictions = []
+model_rhos = []
+i = 0
+for stock in target_stocks:
+    i += 1
+    print(f"Running... {i}/" + str(len(target_stocks)))
+    # Load using custom loader class
+    regression_variables = preprocessor.get_stock(stock)
 
-        # Add controlled noise (simulating real-world imperfections)
-        noise = np.random.normal(0, 0.1, n_of_samples)  # Noise with mean 0 and small std dev
+    # generate technicals
+    train_technicals = preprocessor.generate_technicals(regression_variables.iloc[:train_length])
+    test_technicals = preprocessor.generate_technicals(regression_variables.iloc[train_length:])
 
-        # Create a linear combination of y_normalized and the random feature with added noise
-        feature = desired_rho * y_normalized + np.sqrt(1 - desired_rho ** 2) * x_random_normalized + noise
+    # Normalize the technical indicators
+    scaler = MinMaxScaler()
+    train_technicals_transformed = scaler.fit_transform(train_technicals)
+    train_technicals = pd.DataFrame(train_technicals_transformed, columns=train_technicals.columns, index=train_technicals.index)
+    test_technicals = pd.DataFrame(scaler.transform(test_technicals), columns=test_technicals.columns, index=test_technicals.index)
 
-        # Normalize the generated feature
-        feature = (feature - feature.mean()) / feature.std()
+    # Ensure that y_train and train_technicals have the same length
+    y_train_stock = stocks_y_train[stock].iloc[-len(train_technicals):]
+    y_train = y_train.iloc[-len(train_technicals):]
 
-        # Create adjusted feature with desired correlation
-        features_to_generate[:, n] = feature
+    y_test_stock = stocks_y_test[stock].iloc[-len(test_technicals):]
+    y_test = y_test.iloc[-len(test_technicals):]
 
-    return features_to_generate
+    # Combinations of techincals to train models on
+    combinations = preprocessor.get_combinations(train_technicals, n_features = len(train_technicals.columns))
 
-def ridge_meta_learner(ols_predictions_train: list, ols_predictions_test: list, y_value_train: pd.Series) -> np.array:
-    """
-     Trains and fits a ridge regression model to predict y values using OLS regression model's predictions.
+    # Ensemble Models (N of models ensemble = columns per model)
+    # Clear model to ensure past results don't affect future results
+    ensembler.clear_model()
+    models, rho_with_n_models, meta_output, rho_per_model = ensembler.ensemble(combinations,
+                                                        (train_technicals, y_train_stock),
+                                                         (test_technicals, y_test_stock)
+                                                                 )
 
-     Parameters:
-     ols_predictions_train (dictionary): A dictionary containing the predictions of each model, split for training
-     ols_predictions_test (dictionary): A dictionary containing the predictions of each model, split for testing
-     y_value_train (pd.Series): Series of y values to use for training the ridge model
-     Returns:
-         np.array: a numpy array containing the final predictions of the ridge model
-    """
-    x_meta_train = np.column_stack(ols_predictions_train)
-    x_meta_test = np.column_stack(ols_predictions_test)
-    ridge_model = Ridge(alpha=10)
-    ridge_model.fit(x_meta_train, y_value_train)
-    meta_predictions = ridge_model.predict(x_meta_test)
-    return meta_predictions
-
-
-def neural_network_meta_learner(predictions_train, predictions_test, y_train):
-    # Stack predictions from the base models
-    X_meta_train = pd.DataFrame(predictions_train).T
-    X_meta_test = pd.DataFrame(predictions_test).T
-
-    # Build a neural network with Input layer
-    model = Sequential()
-    model.add(Input(shape=(X_meta_train.shape[1],)))  # Define input shape
-    model.add(Dense(64, activation='relu'))
-    model.add(Dropout(0.3))  # Dropout to prevent overfitting
-    # model.add(Dense(32, activation='relu'))
-    model.add(Dense(1))  # Single output for regression
-    # Compile the model
-    huber_loss = Huber(delta=0.5)  # You can adjust delta depending on how you want to handle outliers
-    model.compile(optimizer='adam', loss=huber_loss)
-
-    # Fit the neural network (you can adjust the number of epochs)
-    early_stopping = EarlyStopping(monitor='loss', patience=10, restore_best_weights=True)
-    model.fit(X_meta_train, y_train, epochs=100, batch_size=64, verbose=1, callbacks=[early_stopping])
-
-    # Get meta predictions
-    meta_predictions = model.predict(X_meta_test)
-
-    return meta_predictions.flatten()
-
-def xgboost_meta_learner(predictions_train, predictions_test, y_train):
-    X_train = np.column_stack(predictions_train)
-    X_test = np.column_stack(predictions_test)
-    xgb_model = XGBRegressor(n_estimators=250, learning_rate=0.05)
-    xgb_model.fit(X_train, y_train)
-    return xgb_model.predict(X_test)
-
-def generate_technicals(close: pd.Series, high: pd.Series, low: pd.Series, volume: pd.Series) -> pd.DataFrame:
-    # Calculate various technical indicators
-    sma = ta.SMA(close, timeperiod=30)
-    ema = ta.EMA(close, timeperiod=30)
-    rsi = ta.RSI(close, timeperiod=30)
-    atr = ta.ATR(high, low, close, timeperiod=14)  # ATR requires high, low, and close (y_value is the close price)
-    mom = ta.MOM(close, timeperiod=30)
-    obv = ta.OBV(close, volume)  # OBV requires close (y_value) and volume
-    slowk, slowd = ta.STOCH(high, low, close, fastk_period=14, slowk_period=3, slowk_matype=0, slowd_period=3, slowd_matype=0)  # Stochastic Oscillator
-    macd, macd_signal, macd_hist = ta.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
-    ad = ta.AD(high, low, close, volume)  # Accumulation/Distribution requires high, low, close (y_value), and volume
-    upper_band, middle_band, lower_band = ta.BBANDS(close, timeperiod=20, nbdevup=2, nbdevdn=2, matype=0)
-    roc = ta.ROC(close, timeperiod=30)
-    width_Bollinger_Band = (upper_band - lower_band) / middle_band * 100
-    # Create a DataFrame with the technical indicators
-    df_technicals = pd.DataFrame({
-        'ATR': atr,
-        # 'SMA': sma,
-        # 'EMA': ema,
-        'RSI': rsi,
-        'MOM': mom,
-        'OBV': obv,
-        'STOCH_K': slowk,
-        'STOCH_D': slowd,
-        'MACD': macd,
-        'MACD_Signal': macd_signal,
-        'MACD_Hist': macd_hist,
-        'AD': ad,
-        'Bollinger_Band_width' : width_Bollinger_Band
-    })
-
-    # Calculate percentage change for each column
-    df_technicals_pct_change = df_technicals.pct_change() * 100
-    df_technicals_pct_change = df_technicals_pct_change.dropna()
-    return df_technicals_pct_change
-
-
-def get_combinations(df_technicals : pd.DataFrame, n_features : int = 2) -> list:
-    indicators = df_technicals.columns.tolist()
-    used_indicators = set()
-    valid_combinations = []
-
-    # Generate all pairs of technical indicators
-    for combo in itertools.combinations(indicators, n_features):
-        if combo[0] not in used_indicators and combo[0] not in used_indicators:
-            # If neither indicator has been used, add the combo and mark them as used
-            valid_combinations.append(combo)
-            used_indicators.update(combo)
-
-    return valid_combinations
-
-# PostgreSQL connection setup
-DATABASE_URL = "postgresql+psycopg2://postgres@localhost:5432/sp500"
-engine = create_engine(DATABASE_URL)
-
-# Read S&P500 Data
-
-query = "SELECT * FROM sp500_data_yahoo"
-regression_variables = pd.read_sql(query, engine)
-regression_variables['date'] = pd.to_datetime(regression_variables['date'])
-regression_variables.set_index('date', inplace=True)
-regression_variables = regression_variables.sort_index()
-
-# Extract the necessary columns
-high = regression_variables['high']
-low = regression_variables['low']
-close = regression_variables['close']
-volume = regression_variables['volume']
-
-y = close
-
-# Parameters
-n_of_features = 20
-test_length = int(len(y) * 0.2)
-max_N_Models = 100
-num_samples = len(y)
-# rho_values = [0.1, 0.2, 0.3, 0.4]
-rho_values = ["UNKNOWN"]
-y_train, y_test = y[test_length:], y[:test_length]
-train_technicals = generate_technicals(y_train, high[test_length:], low[test_length:], volume[test_length:])
-test_technicals = generate_technicals(y_test, high[:test_length], low[:test_length], volume[:test_length])
-y_train = y_train.pct_change() * 100
-y_test = y_test.pct_change() * 100
-# Drop NaN values from technical indicators
-
-# Lag the technical indicators by 1 day to avoid leakage
-train_technicals = train_technicals.shift(1)
-test_technicals = test_technicals.shift(1)
-
-train_technicals = train_technicals.dropna()
-test_technicals = test_technicals.dropna()
-print("Technicals used:", train_technicals.columns)
-# Align y_train and y_test to the cleaned technicals data
-y_train = y_train[-len(train_technicals):]  # Trim y_train to match technicals length
-y_test = y_test[-len(test_technicals):]
-"""
-# N of models with technicals using Combinatorics, The rho value : TODO
-# Try with different meta learners : TODO
-# Change values to relative percentage change : DONE
-"""
-
-combinations = get_combinations(train_technicals, n_features = 1)
-
-# Run model on S&P500 y values
-for rho in rho_values:
-    print(f"Running on Rho = {rho}...")
-    rho_with_n_models = []
-    # Train models
-    models = []
-    predictions_train = []
-    predictions_test = []
-    model_rho = []
-    # for i in range(1, max_N_Models+1):
-    for i, combo in enumerate(combinations):
-        x_train = train_technicals[list(combo)]
-        x_test = test_technicals[list(combo)]
-        x_train = sm.add_constant(x_train)
-        ridge_model = Ridge(alpha=10)
-        ridge_model.fit(x_train, y_train)
-        # model = sm.OLS(y_train, x_train).fit()
-        x_test = sm.add_constant(x_test)
-        models.append(ridge_model)
-        predictions_train.append(ridge_model.predict(x_train))
-        predictions_test.append(ridge_model.predict(x_test))
-        model_rho.append(pearsonr(y_test, predictions_test[len(predictions_test)-1])[0])
-
-
-    # Fit and train meta-learner on a specified number of models (1 to Max_N_models)
-    # for i in range(1, max_N_Models+1):
-    for i, _ in enumerate(combinations):
-        if (model_rho[i] > 0):
-            N_models = i + 1
-            pred_train = predictions_train[:N_models]
-            pred_test = predictions_test[:N_models]
-            # Meta learner used for ensembling, currently Ridge learner
-            meta_learner_predictions = ridge_meta_learner(pred_train, pred_test, y_train)
-            rho_avg = pearsonr(y_test, meta_learner_predictions)[0]
-            rho_with_n_models.append(rho_avg)
-    for i in range(len(rho_with_n_models)):
-        print(f"{i+1} models rho : {rho_with_n_models[i]}")
-    max_N_Models = len(rho_with_n_models)
-
-    # Plotting
-
-    # # Fit the logistic function to the data
-    # num_models_range = np.arange(1, max_N_Models + 1)
-    # # noinspection PyTupleAssignmentBalance
-    # popt, _ = curve_fit(logistic_function, num_models_range, rho_with_n_models, p0=[1, (max_N_Models/2), 0.5], maxfev=10000)
-    #
-    # # fitted parameters
-    # a,b,c = popt
-    # print(f'Logistic Function Parameters: a={a:.4f}, b={b:.4f}, c={c:.4f}')
-    #
-    # epsilon = 1e-3
-    # try:
-    #     x_n = b - (1/a) * math.log(epsilon/(c*a))
-    #     print(f"--------Actual for Rho = {rho}--------")
-    #     print(f"for e = {epsilon}, x should be greater than: {x_n:.4f}")
-    #     print(f"Recommend N of models = {x_n}")
-    #     print(f"Ideal rho is somewhere near : {c} (BASED ON PREVIOUS DATA)")
-    #     print()
-    # except ValueError as e:
-    #     print(f"--------Actual for Rho = {rho}--------")
-    #     print(f"Ideal rho is somewhere near : {c} (BASED ON PREVIOUS DATA)")
-    #     print()
-    #     x_n = -1
-    # # Generate data for plotting the fit
-    # x_fit = np.linspace(num_models_range.min(), num_models_range.max(), 500)
-    # y_fit = logistic_function(x_fit, *popt)
-
-
-    plt.figure(figsize=(10, 6))
-    # plt.plot(x_fit, y_fit, '-', label='Logistic Fit', color='r')
-    plt.plot(range(1, max_N_Models + 1), rho_with_n_models, color='b')
-    # Export the data to a text file
-    np.savetxt(f"Rho_{rho}.csv", np.column_stack([range(1, max_N_Models + 1), rho_with_n_models]), delimiter=",", header="x,y", comments="")
-
-    plt.title(f'Rho = {rho}~')
-    plt.xlabel('N Models Combined')
-    plt.ylabel('Rho as Models are combined')
-    # Add logistic function parameters to the side of the plot
-    # plt.text(x=plt.xlim()[1] * 0.6, y=plt.ylim()[1] * 0.3,
-    #          s=f'Logistic Function Parameters:\na={a:.4f}\nb={b:.4f}\nc={c:.4f}\n'
-    #            f'Recommend N models for e= {epsilon}: {int(x_n)}',
-    #          bbox=dict(facecolor='white', alpha=0.8),
-    #          fontsize=12, color='black')
-    # plt.legend(loc='upper left')
-    plt.grid(True)
-    plt.show()
+    # Get last output (with Max N models and using all techincals)
+    for output in meta_output:
+        predictions.append(output)
+    # predictions.append(meta_output[-1])
+    model_rhos.append(rho_with_n_models[-1])
 
 
 
-# Plot all results on one graph
+# Store outputs in a dataframe
+df_pred = pd.DataFrame()
+for i in range(len(predictions)):
+    df_pred[f'{i}'] = predictions[i]
 
-# File paths
-file_rho_01 = 'Rho_0.1.csv'
-file_rho_02 = 'Rho_0.2.csv'
-file_rho_03 = 'Rho_0.3.csv'
-file_rho_04 = 'Rho_0.4.csv'
+# Ensemble Models (N of models ensemble = columns per model)
+combinations = preprocessor.get_combinations(df_pred, n_features=1)
 
-# Load the datasets
-rho_01_df = pd.read_csv(file_rho_01)
-rho_02_df = pd.read_csv(file_rho_02)
-rho_03_df = pd.read_csv(file_rho_03)
-rho_04_df = pd.read_csv(file_rho_04)
+# Split into train / test for the last model
+train_final_length = int(len(df_pred) * 0.5)
+df_pred_train, df_pred_test = df_pred.iloc[:train_final_length], df_pred.iloc[train_final_length:]
+y_sp500_train, y_test = y_test.iloc[:train_final_length], y_test.iloc[train_final_length:]
 
-# Plot for Rho 0.1
-plt.plot(rho_01_df['x'], rho_01_df['y'], label='Rho = 0.1')
+# Normalize the predictions
+scaler = MinMaxScaler()
+df_pred_transformed = scaler.fit_transform(df_pred_train)
+df_pred_train = pd.DataFrame(df_pred_transformed, columns=df_pred_train.columns,
+                                index=df_pred_train.index)
+df_pred_test = pd.DataFrame(scaler.transform(df_pred_test), columns=df_pred_test.columns,
+                               index=df_pred_test.index)
 
-# Plot for Rho 0.2
-plt.plot(rho_02_df['x'], rho_02_df['y'], label='Rho = 0.2')
+# Bin values
+y_sp500_train, y_test = bin_values(y_sp500_train, y_test, num_bins=len(y_sp500_train)//2)
 
-# Plot for Rho 0.3
-plt.plot(rho_03_df['x'], rho_03_df['y'], label='Rho = 0.3')
+# Clear model previous information to avoid learning from past models' data
+ensembler.clear_model()
+print("FINAL MODEL:\n")
+models, rho_with_n_models, meta_output, rho_per_model = ensembler.ensemble(combinations,
+                                                    (df_pred_train, y_sp500_train),
+                                                     (df_pred_test, y_test)
+                                                             )
 
-# Plot for Rho 0.4
-plt.plot(rho_04_df['x'], rho_04_df['y'], label='Rho = 0.4')
 
-# Adding titles and labels
+# Assume y_true and y_pred are your actual and predicted percentage changes
+y_true = y_test
+y_pred = meta_output[-1]
+
+
+# MAE
+mae = mean_absolute_error(y_true, y_pred)
+print(f"MAE: {mae}")
+
+# RMSE
+rmse = mean_squared_error(y_true, y_pred)
+print(f"RMSE: {rmse}")
+
+# MAPE
+mape = mean_absolute_percentage_error(y_true, y_pred)
+print(f"MAPE: {mape}")
+
+# Rho (Spearman's rank correlation)
+rho, _ = spearmanr(y_true, y_pred)
+print(f"Spearman's Rho: {rho}")
+
+# Pearson Correlation Coefficient
+corr, _ = pearsonr(y_true, y_pred)
+print(f"Pearson Correlation: {corr}")
+
+# Directional Accuracy
+direction_accuracy = np.mean(np.sign(y_true) == np.sign(y_pred))
+print(f"Directional Accuracy: {direction_accuracy}")
+
+# R-Squared (R2)
+r2 = r2_score(y_true, y_pred)
+print(f"R-Squared: {r2}")
+
+
+# Create a color map and normalize the values between min and max
+cmap = plt.get_cmap('coolwarm')
+norm = Normalize(vmin=min(model_rhos), vmax=max(model_rhos))
+
+# Create the bar chart
+bars = plt.bar(target_stocks, model_rhos, color=cmap(norm(model_rhos)))
+
+# Add numbers on top of bars
+for bar, value in zip(bars, model_rhos):
+    plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height() - 0.05, f'{value:.2f}',
+             ha='center', va='bottom', color='black', fontsize=10)
+
+# Set labels and title
+# Set y-axis limits to center the plot around 0
+max_abs_value = max(abs(min(model_rhos)), abs(max(model_rhos)))
+plt.ylim(-max_abs_value - 0.2, max_abs_value + 0.2)
+
+plt.xlabel('Stock:')
+plt.ylabel('Rho')
+plt.title('Rho by models')
+plt.grid(True, which='major', axis='y', linestyle='--', linewidth=0.7, color='gray', alpha=0.7)
+# Show the plot
+plt.show()
+
+plt.figure(figsize=(10, 6))
+plt.plot(range(1, len(rho_with_n_models) + 1), rho_with_n_models, color='b')
+plt.title(f'Using ALL')
+plt.xlabel('N Models Combined')
+plt.ylabel('Rho as Models are combined')
 plt.grid(True)
-plt.title('Combined Rho Values vs Number of Models Used in Ensemble')
-plt.xlabel('Number of Models')
-plt.ylabel('Combined Rho Value')
-plt.xlim(xmin=1, xmax=max_N_Models+1)
-plt.legend()
-# plt.show()
+plt.show()
